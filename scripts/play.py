@@ -64,6 +64,11 @@ parser.add_argument("--gait", type=str, default=None,
                     choices=[None, "walk", "amble", "trot", "pace", "bound", "pronk",
                              "canter", "transverse_gallop", "rotary_gallop"],
                     help="Force coupling matrix to this gait (overrides task's active_gaits pool).")
+parser.add_argument("--gait_sequence", type=str, default=None,
+                    help="Timed gait transitions: 'gait:steps[:vel_x],...'. "
+                         "E.g. 'trot:600:0.8,walk:600:0.4,pace:600:0.4'. "
+                         "Switches Φ (and optionally vel_x) at each step boundary. "
+                         "Tip: set --episode_length to sum of all step counts.")
 
 # Policy sampling mode
 parser.add_argument("--stochastic", action="store_true",
@@ -172,6 +177,17 @@ def _freeze_gait(env_unwrapped, gait_name: str | None) -> None:
     from allgaits.cpg.coupling import phase_offset_matrix
     phi = phase_offset_matrix(gait_name, device=env_unwrapped.device)
     env_unwrapped._phi[:] = phi.unsqueeze(0)
+
+
+def _parse_gait_sequence(spec: str, default_vel: float) -> list[tuple[str, int, float]]:
+    """Parse 'gait:steps[:vel_x],...' into [(gait, steps, vel_x), ...] tuples."""
+    result = []
+    for seg in spec.split(","):
+        parts = seg.strip().split(":")
+        if len(parts) < 2:
+            raise ValueError(f"Bad gait_sequence segment {seg!r}; expected gait:steps[:vel_x]")
+        result.append((parts[0], int(parts[1]), float(parts[2]) if len(parts) >= 3 else default_vel))
+    return result
 
 
 def _print_header(cfg, applied_style: dict[str, float], vel_x_cmd: float) -> None:
@@ -324,7 +340,10 @@ def _print_summary(per_env_stats: dict[str, list[torch.Tensor]], num_envs: int) 
         print("  ".join(row))
     print("-" * len(hdr))
     total_vx = vx.mean().item()
-    print(f"  Across all envs: mean vx = {total_vx:+.3f} m/s  (cmd = {args.vel_x:+.2f} m/s,  error = {args.vel_x - total_vx:+.3f} m/s)")
+    if args.gait_sequence:
+        print(f"  Across all envs: mean vx = {total_vx:+.3f} m/s  (sequence: {args.gait_sequence})")
+    else:
+        print(f"  Across all envs: mean vx = {total_vx:+.3f} m/s  (cmd = {args.vel_x:+.2f} m/s,  error = {args.vel_x - total_vx:+.3f} m/s)")
     print("=" * 100)
 
 
@@ -407,11 +426,27 @@ def main() -> None:
         env_unwrapped, h=args.fix_h, g_c=args.fix_g_c, g_p=args.fix_g_p, x_off=args.fix_x_off
     )
 
-    # Optional gait override (force coupling matrix Φ).
-    _freeze_gait(env_unwrapped, args.gait)
+    # Gait control: single --gait override or timed --gait_sequence transitions.
+    _gait_seq: list[tuple[str, int, float]] | None = None
+    _seq_seg_idx = -1
+    _seq_gait: str | None = args.gait
+    _seq_vel: float = args.vel_x
+
+    if args.gait_sequence:
+        _gait_seq = _parse_gait_sequence(args.gait_sequence, args.vel_x)
+        _seq_seg_idx = 0
+        _seq_gait, _, _seq_vel = _gait_seq[0]
+        env_unwrapped._vel_cmd[:, 0] = _seq_vel
+    _freeze_gait(env_unwrapped, _seq_gait)
 
     _print_header(env_unwrapped.cfg, applied_style, args.vel_x)
-    if args.gait is not None:
+    if args.gait_sequence:
+        total_seq_steps = sum(s for _, s, _ in _gait_seq)
+        print(f"  gait_sequence   {args.gait_sequence}")
+        print(f"  seq total steps {total_seq_steps}  (--episode_length should match)")
+        print(f"[gait_sequence] step     0 → gait={_seq_gait}, vel_x={_seq_vel:.2f}")
+        print("=" * 100)
+    elif args.gait is not None:
         print(f"  gait override   {args.gait}  (overrides active_gaits pool)")
         print("=" * 100)
 
@@ -456,17 +491,36 @@ def main() -> None:
     resets_window: list[list[int]] = [[] for _ in range(args.num_envs)]
     _prev_foot_pos_w = env_unwrapped._robot.data.body_pos_w[:, _artic_foot_ids, :].clone()
     _slip_log: list[dict] = []
+    _jnt_cols = [
+        f"{leg}_{jt}" for leg in ("FL", "FR", "RL", "RR")
+        for jt in ("hip", "thigh", "calf")
+    ]
+    _joint_log: list[dict] = []
 
     for step in range(args.episode_length):
+        # Advance gait_sequence: detect segment boundary and switch Φ + vel_x.
+        if _gait_seq is not None:
+            acc = 0
+            new_idx = len(_gait_seq) - 1
+            for idx, (_, seg_steps, _) in enumerate(_gait_seq):
+                if step < acc + seg_steps:
+                    new_idx = idx
+                    break
+                acc += seg_steps
+            if new_idx != _seq_seg_idx:
+                _seq_seg_idx = new_idx
+                _seq_gait, _, _seq_vel = _gait_seq[_seq_seg_idx]
+                print(f"\n[gait_sequence] step {step:5d} → gait={_seq_gait}, vel_x={_seq_vel:.2f}")
+
         # Re-freeze every step in case env resets in _reset_idx (which re-samples
         # vel_cmd, style params, and Φ for the reset env_ids).
-        env_unwrapped._vel_cmd[:, 0] = args.vel_x
+        env_unwrapped._vel_cmd[:, 0] = _seq_vel
         env_unwrapped._vel_cmd[:, 1] = 0.0
         env_unwrapped._vel_cmd[:, 2] = 0.0
         _freeze_style_params(
             env_unwrapped, h=args.fix_h, g_c=args.fix_g_c, g_p=args.fix_g_p, x_off=args.fix_x_off
         )
-        _freeze_gait(env_unwrapped, args.gait)
+        _freeze_gait(env_unwrapped, _seq_gait)
         _disable_resampling(env_unwrapped)
 
         with _inference():
@@ -493,6 +547,8 @@ def main() -> None:
         _contact_now = env_unwrapped._foot_contact_booleans()                       # (N, 4)
         _prev_foot_pos_w = _foot_pos_w.detach().clone()
 
+        _jv = env_unwrapped._robot.data.joint_vel[:, env_unwrapped._cpg_to_usd_joint_idx].detach().cpu()  # (N, 12) CPG order
+        _bv = env_unwrapped._robot.data.root_lin_vel_b.detach().cpu()   # (N, 3)
         for _ei in range(args.num_envs):
             for _li in range(4):
                 _slip_log.append({
@@ -503,6 +559,14 @@ def main() -> None:
                     "foot_world_x": _foot_pos_w[_ei, _li, 0].item(),
                     "foot_slip_vx": _foot_vx[_ei, _li].item(),
                 })
+            _joint_log.append({
+                "step": step + 1,
+                "env": _ei,
+                "gait": _seq_gait if _seq_gait else "sampled",
+                "vx_cmd": _seq_vel,
+                "bvx": _bv[_ei, 0].item(),
+                **{col: _jv[_ei, j].item() for j, col in enumerate(_jnt_cols)},
+            })
 
         if (step + 1) % args.log_every == 0 or step == 0:
             _print_env_table(step + 1, snap, resets_window)
@@ -520,6 +584,14 @@ def main() -> None:
         _w.writeheader()
         _w.writerows(_slip_log)
     print(f"\n[play] foot slip log → {_slip_path}  ({len(_slip_log)} rows)")
+
+    _joint_path = "play_joint_log.csv"
+    _jnt_fields = ["step", "env", "gait", "vx_cmd", "bvx"] + _jnt_cols
+    with open(_joint_path, "w", newline="") as _f:
+        _w = csv.DictWriter(_f, fieldnames=_jnt_fields)
+        _w.writeheader()
+        _w.writerows(_joint_log)
+    print(f"[play] joint velocity log → {_joint_path}  ({len(_joint_log)} rows)")
 
     env.close()
     sim_app.close()

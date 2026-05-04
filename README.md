@@ -41,48 +41,83 @@ Port the AllGaits framework to the Unitree B1 in Isaac Lab 0.36.3 / Isaac Sim 4.
    - **Hopf CPG** ([allgaits/cpg/hopf.py](allgaits/cpg/hopf.py)) — batched, GPU-ready, forward-Euler at 1 kHz per paper eqs 1–2. Convergence factor `a = 150` inherited from CPG-RL (Bellegarda 2022 RAL §III-A).
    - **Coupling matrices** for all 9 gaits ([allgaits/cpg/coupling.py](allgaits/cpg/coupling.py)) — Φ derived from Fig. 3 contact timings, plus `batch_coupling_matrices()` for per-env heterogeneous gait sampling.
    - **B1 leg FK/IK** ([allgaits/kinematics/b1.py](allgaits/kinematics/b1.py)) — 3-DOF quadruped leg with abduction-hip, thigh, calf. URDF-verified geometry (L1=L2=0.35 m, hip-abduction arm 0.12675 m). Also exposes `B1_COM_OFFSET_X = -0.018 m`: B1's overall COM sits ~1.8 cm behind the geometric center of the body (mass asymmetry from 0.8 rad front-thigh vs 1.0 rad rear-thigh defaults). Mirrors AllGaits' Go1 observation (§III-A) that COM-behind-hips motivates negative `x_off`.
-   - **Pattern formation** ([allgaits/cpg/pattern.py](allgaits/cpg/pattern.py)) — paper eqs 3–4: CPG state `(r, θ)` + style params `(h, g_c, g_p, x_off, d_step)` → foot target → IK → joint position targets. Exposes `B1_STYLE_PARAM_RANGES` scaled 1.5× from the paper's Go1 ranges (h∈[0.27, 0.52], g_c∈[0.03, 0.18], x_off∈[-0.12, 0.04] — biased negative to align with B1's COM).
-3. **Isaac Lab env** ([allgaits/envs/](allgaits/envs/)) ✅ *mechanically working; see debugging log below*
+   - **Pattern formation** ([allgaits/cpg/pattern.py](allgaits/cpg/pattern.py)) — paper eqs 3–4: CPG state `(r, θ)` + style params `(h, g_c, g_p, x_off, d_step)` → foot target → IK → joint position targets. Exposes `B1_STYLE_PARAM_RANGES` scaled 1.5× from the paper's Go1 ranges (h∈[0.27, 0.52], g_c∈[0.03, 0.18], x_off∈[−0.12, 0.04] — biased negative to align with B1's COM).
+3. **Isaac Lab env** ([allgaits/envs/](allgaits/envs/)) ✅
    - `AllGaitsEnvCfg` ([allgaits_env_cfg.py](allgaits/envs/allgaits_env_cfg.py)) — physics 1 kHz, policy 100 Hz (decimation 10), 20 s episodes, 4096 envs. Action ∈ ℝ⁸ linear-scaled + clamped to μ∈[1,2], ω∈[0,8] Hz. Observation 64-D matching paper §II-B.
-   - `AllGaitsEnv` ([allgaits_env.py](allgaits/envs/allgaits_env.py)) — CPG integrated at 1 kHz inside `_apply_action`; pattern formation + IK produces joint PD targets; per-env Φ sampled from `active_gaits` pool. Periodic resampling (`v*` every 5 s, `Φ` every 3 s) per paper §II-C.
-   - Reward (final): `lin_vel_x_track (6·dt) + lin_vel_x_direct (2·dt) + heading (1.5·dt) + cpg_active (0.5·dt, capped 3 Hz) − cpg_runaway (2.0·dt, quadratic above 3 Hz) − lin_vel_yz (2·dt) − ω_xyz (0.35·dt) − power (0.001·dt) − action_rate (0.025·dt)`. See debugging log §8–9 for the reward-tuning history.
-   - Diagnostic logging: per-term reward, locomotion state (vel cmd/actual, height, tilt), action stats (raw mag, clip fraction, μ/ω means, rate), termination breakdown (fall_rate, timeout_rate, peak force). All 19 metrics printed per iteration AND logged to TensorBoard under `Episode/*`.
+   - `AllGaitsEnv` ([allgaits_env.py](allgaits/envs/allgaits_env.py)) — CPG integrated at 1 kHz inside `_apply_action`; pattern formation + IK produces joint PD targets; per-env Φ sampled from `active_gaits` pool. Periodic resampling (`v*` fixed per episode, `Φ` every 3 s) per paper §II-C.
+   - **Reward (current):** `lin_vel_x_track (8·dt, σ=0.25) + lin_vel_x_direct (2·dt, clamped at cmd) + heading (3.0·dt) + cpg_active (0.5·dt, linear up to 3 Hz) − cpg_runaway (2.0·dt, quadratic above 3 Hz) − foot_slip (1.0·dt) − lin_vel_yz (2·dt) − ω_xyz (0.35·dt) − power (0.001·dt) − action_rate (0.025·dt)`. See debugging log §8–13 for reward-tuning history.
+   - **Domain randomization:** push velocity perturbation (Δv_xy ≤ 0.5 m/s, Δω_z ≤ 0.3 rad/s) every 4 s per env via `write_root_velocity_to_sim`; joint position noise ±0.07 rad at reset (scaled from paper's ±0.2 rad by B1/Go1 stiffness ratio 200/600).
+   - Diagnostic logging: per-term reward, locomotion state (vel cmd/actual, height, tilt), action stats (raw mag, clip fraction, μ/ω means, rate), termination breakdown (fall_rate, timeout_rate, peak force). All metrics logged to TensorBoard under `Episode/*`.
    - Spawn z-offset +0.08 m added in reset to prevent sub-ground foot settling; termination threshold 50 N on base/thigh (absorbs reset-settling transients).
    - **Local B1 override** ([b1_cfg.py](allgaits/envs/b1_cfg.py)) — `UNITREE_B1_ALLGAITS_CFG` with stiffness=600, damping=15 (up from shared default 200/5). Required because B1 at 62 kg sags ~9 cm under the default gains; local override avoids side-effects on `cpg-drl-transition`.
    - **Smoke test**: `python scripts/test_env.py --headless --num_envs 16 --steps 100` — requires Isaac Sim.
-4. **PPO training** (RSL-RL 2.2.4) ✅ *Phase B complete — 3 gaits working*
+4. **PPO training** (RSL-RL 2.2.4) ✅ *Phase B complete — 3 gaits working with DR*
    - [allgaits/training/ppo_cfg.py](allgaits/training/ppo_cfg.py) — `AllGaitsPpoRunnerCfg`: batch 4096×24, 5 epochs, 4 mini-batches, clip 0.2, **entropy 0.001** (down from CPG-RL Table I's 0.01), γ=0.99, λ=0.95, KL target 0.01, MLP [512, 256, 128] ELU, `init_noise_std=0.5`, `empirical_normalization=True`.
-   - [allgaits/tasks/__init__.py](allgaits/tasks/__init__.py) — three registered gym tasks (one per phase): `Isaac-AllGaits-B1-Trot-v0`, `…-3Gait-v0`, `…-Full-v0`. Same env, different `active_gaits`.
-   - [scripts/train.py](scripts/train.py) — entry point. `python scripts/train.py --task Isaac-AllGaits-B1-3Gait-v0 --num_envs 4096 --headless --max_iterations 6000`. Saves `final_model.pt` alias after training.
-   - [scripts/play.py](scripts/play.py) — per-env diagnostic table; supports `--load_run` (exact name or regex), `--model` (step number or `final_model`), `--stochastic`, `--bypass_policy`, `--fix_h/g_c/x_off` style overrides, `--gait` coupling-matrix override. Prints PhysX-vs-FK ground-truth at step 1.
+   - [allgaits/tasks/__init__.py](allgaits/tasks/__init__.py) — three registered gym tasks: `Isaac-AllGaits-B1-Trot-v0`, `…-3Gait-v0`, `…-Full-v0`. Same env, different `active_gaits`.
+   - [scripts/train.py](scripts/train.py) — entry point. `python scripts/train.py --task Isaac-AllGaits-B1-3Gait-v0 --num_envs 4096 --headless --max_iterations 5000`. Saves `final_model.pt` alias after training.
+   - [scripts/play.py](scripts/play.py) — per-env diagnostic table; supports `--load_run` (exact name or regex), `--model` (step number or `final_model`), `--stochastic`, `--bypass_policy`, `--fix_h/g_c/x_off` style overrides, `--gait` single-gait override, `--gait_sequence "gait:steps[:vel_x],..."` for mid-episode switching sequences. Prints PhysX-vs-FK ground-truth at step 1.
+   - [scripts/plot_jerk.py](scripts/plot_jerk.py) — joint-velocity jerk plot from `play_joint_log.csv`. Computes jerk = Δ²(joint_vel)/dt² per leg and per joint type; subplot 3 overlays body forward velocity vs command. Run after play to diagnose gait transition smoothness.
    - Logs: `logs/rsl_rl/allgaits_b1/` (TensorBoard: `tensorboard --logdir logs/rsl_rl/allgaits_b1`)
 5. **Sim evaluation** ✅ *3 gaits validated in play*
 
-### Demo results — checkpoint `logs/rsl_rl/allgaits_b1/phase_b_3gaits/final_model.pt`
+### Best checkpoint — `logs/rsl_rl/allgaits_b1/phase_b_dr_v2/final_model.pt`
 
-Trained on Phase B (walk/trot/pace), 6000 iterations, 4096 envs. Style params fixed at h=0.35, g_c=0.08, x_off=−0.04 for stable play.
+Trained on Phase B (walk/trot/pace) + domain randomization (push forces + joint noise) + heading reward 3.0 + foot slip penalty. 5000 iterations, 4096 envs.
 
-| Gait | cmd (m/s) | mean vx (m/s) | tracking | falls |
-|------|-----------|---------------|----------|-------|
-| Trot | 0.80 | +0.558 | 70% | 0/4 |
-| Walk | 0.40 | +0.417 | 104% | 0/4 |
-| Pace | 0.40 | +0.295 | 74% | 1/4 |
+**End-of-training metrics (iteration 4999):**
 
-**Known limitation**: systematic rightward yaw drift across all gaits — the robot trots/walks forward in its own frame but rotates ~180° over 20 s. Caused by front/rear thigh asymmetry (0.8 vs 1.0 rad defaults) creating unequal step lengths; heading reward at 1.5 is insufficient to fully counteract it.
+| Metric | Value |
+|--------|-------|
+| Mean episode length | 1952 / 2000 steps |
+| Fall rate | 0.000 |
+| vel_x cmd (mean) | 1.34 m/s |
+| vel_x actual (mean) | 0.997 m/s |
+| vel_x error (mean) | 0.34 m/s |
+| ω_Hz (mean) | 2.78 Hz |
+| foot slip penalty | −0.0013 (near zero) |
+| Mean noise std | 0.15 |
 
 ```bash
 # trot
-python scripts/play.py --load_run phase_b_3gaits --model final_model \
-    --gait trot --vel_x 0.8 --num_envs 4 --fix_h 0.35 --fix_g_c 0.08 --fix_x_off -0.04
+python scripts/play.py --load_run phase_b_dr_v2 --model final_model \
+    --gait trot --vel_x 0.8 --num_envs 4
 
-# walk
-python scripts/play.py --load_run phase_b_3gaits --model final_model \
-    --gait walk --vel_x 0.4 --num_envs 4 --fix_h 0.35 --fix_g_c 0.08 --fix_x_off -0.04
+# walk → trot → pace sequence
+python scripts/play.py --load_run phase_b_dr_v2 --model final_model \
+    --gait_sequence "walk:200:0.5,trot:200:1.0,pace:200:1.2" \
+    --episode_length 600 --num_envs 4
 
-# pace
-python scripts/play.py --load_run phase_b_3gaits --model final_model \
-    --gait pace --vel_x 0.4 --num_envs 4 --fix_h 0.35 --fix_g_c 0.08 --fix_x_off -0.04
+# jerk analysis
+python scripts/plot_jerk.py --smooth 20
 ```
+
+**Training progression (Phase B):**
+
+| Run | Key change | Mean vx | Falls |
+|-----|-----------|---------|-------|
+| `phase_b_3gaits` | baseline (heading=1.5, no DR) | ~0.56 m/s trot | 0/4 but severe yaw drift |
+| `phase_b_dr_v1` | + DR (push + joint noise) | 0.21 m/s | 0 — DR working but yaw drift persisted |
+| `phase_b_dr_v2` | + heading=3.0, foot slip penalty | **0.97 m/s** | **0** — 5× improvement |
+
+### Differences from the paper
+
+| Aspect | Paper (AllGaits, Go1) | This repo (B1) | Reason |
+|--------|----------------------|----------------|--------|
+| **Robot** | Unitree Go1 (12 kg, leg 0.41 m) | Unitree B1 (62 kg, leg 0.70 m) | Course project target |
+| **Simulator** | Isaac Gym | Isaac Lab 0.36.3 / Isaac Sim 4.5 | Isaac Gym deprecated |
+| **Gait scope** | All 9 gaits trained | Phase B: walk/trot/pace only | Time constraint |
+| **Style param ranges** | h∈[0.18,0.35], g_c∈[0.02,0.12], x_off∈[−0.08,0.03] | h∈[0.27,0.52], g_c∈[0.03,0.18], x_off∈[−0.12,0.04] | Scaled 1.5× for B1's larger frame; x_off biased negative to match B1 COM offset |
+| **Actuator gains** | Go1 defaults | stiffness=600, damping=15 | B1 at 62 kg sags 9 cm under Go1-class gains (debug §5) |
+| **Velocity command** | v* resampled every 5 s | v* fixed for full episode (20 s) | Policy was learning cmd-derivative rather than steady-state tracking |
+| **Domain randomization** | Not detailed in paper | Push Δv_xy ≤ 0.5 m/s / Δω_z ≤ 0.3 rad/s every 4 s; joint noise ±0.07 rad at reset | B1 stiffness 600 N·m/rad → noise scaled by 200/600 vs paper's ±0.2 rad; mass DR skipped (`write_body_mass_to_sim` absent in Isaac Lab 0.36.3) |
+| **Reward: tracking** | Gaussian exp(−err²/σ), weight=3, σ unspecified | weight=8, σ=0.25 | σ=0.15 killed gradient at typical 0.3 m/s operating error (debug §12); weight raised to compensate |
+| **Reward: direct vel** | Not in paper | +2.0 × clamp(vx, 0, cmd) × dt | Breaks ω=0 standstill basin; clamped at cmd to remove above-command incentive |
+| **Reward: heading** | Not in paper | +3.0 × cos(yaw error) × dt | Prevents yaw drift from thigh asymmetry; doubled 1.5→3.0 after yaw spin persisted at lower weight (debug §11) |
+| **Reward: foot slip** | Not in paper | −1.0 × mean(contact × foot_speed_xy) × dt | 1–3 m/s sliding on planted feet observed in play; penalises planted-foot movement |
+| **Reward: CPG active** | Not in paper | +0.5 × min(ω,3Hz) × dt − 2.0 × max(ω−3,0)² × dt | Breaks ω=0 basin while capping frequency; without the upper penalty ω blew to 6-8 Hz (debug §9) |
+| **Reward: ang_vel** | Weight not stated (CPG-RL Table I: 0.5) | 0.35 | 2.0 collapsed all non-trot gaits; 0.1 allowed spinning; 0.35 balances (debug §8) |
+| **Reward: action-rate** | Not in paper | −0.025 × ‖Δa‖² × dt | Required to prevent Gaussian action-noise std running away (debug §3) |
+| **entropy_coef** | 0.01 (CPG-RL Table I) | 0.001 | Paired with action-rate penalty to equilibrate noise std ≈ 1 |
 
 ### Phased milestone plan
 
@@ -92,7 +127,7 @@ Paper-fidelity code, phased config validation (no code changes between phases �
 |---|---|---|---|---|
 | 1 | Infra | — | CPG + IK + env scaffold, all unit-tested | ✅ |
 | 2 | **A** | `{trot}` only | Confirm PPO loop converges to B1 trot at commanded velocity | ✅ |
-| 3 | **B** | `{walk, trot, pace}` | 3 gaits working at target velocity | ✅ trot 70%, walk 104%, pace 74% |
+| 3 | **B** | `{walk, trot, pace}` | 3 gaits working at target velocity | ✅ mean vx 0.97 m/s, 0 falls, DR robust |
 | 4 | **C** | all 9 + transitions | Full AllGaits result | ⏳ out of scope for deadline |
 
 ### Tests
@@ -176,6 +211,21 @@ Phase A took five training runs and a lot of bypass-mode diagnostics to get the 
 - **Cause**: `_find_latest_checkpoint` sorted run directories alphabetically (`v2 > v1`) and checkpoint filenames as strings (`"950" > "5999"` because `"9" > "5"`).
 - **Fix**: sort runs by `os.path.getmtime()` (newest last), sort checkpoints by `int(re.search(r"(\d+)", f).group(1))`. Also added exact-name matching so timestamp directories like `2026-05-03_21-15-39` can be passed directly without regex escaping.
 
+### 11. Systematic yaw drift from B1 thigh asymmetry (heading reward insufficient)
+- **Symptom**: phase_b_3gaits model walked/trotted forward in body frame but rotated ~180° over 20 s. During play, `bodyX→w` rotated from `(+1.00, 0.00)` to `(−1.00, 0.00)` indicating a full reversal.
+- **Cause**: B1 default thigh angles differ front/rear (0.8 rad vs 1.0 rad). This creates unequal stance leg geometry: front legs produce a slightly different ground-reaction-force moment than rear, resulting in a net yaw torque that the `ang_vel_xyz` penalty alone suppresses only transiently. A heading reward at weight=1.5 was insufficient to overcome the continuous torque.
+- **Fix**: doubled heading reward from 1.5 → **3.0**. At phase_b_dr_v2, yaw drift was suppressed enough to achieve 0.97 m/s forward tracking with acceptable heading maintenance.
+
+### 12. Velocity tracking gradient vanished at σ=0.15 (below-target operating point)
+- **Symptom**: Training converged to vel_x_actual ≈ 1.0 m/s while cmd ≈ 1.34 m/s (25% error). The tracking reward at σ=0.15 with 0.34 m/s error is `exp(−0.34²/0.15²) = exp(−5.14) ≈ 0.006` — essentially flat. PPO had almost no gradient signal to push the robot faster.
+- **Cause**: σ=0.15 was set to prevent standstill from earning tracking reward. But once `lin_vel_x_direct` was added (which already breaks the standstill basin), a tight σ is no longer needed and starves the gradient at realistic operating errors.
+- **Fix**: widened σ back to **0.25** and raised tracking weight to **8.0**. At σ=0.25, gradient at 0.34 m/s error is `exp(−1.85) ≈ 0.16` — 26× more signal than before. Standstill remains suppressed by the direct-velocity term.
+
+### 13. Velocity overshoot — robot exceeded commanded speed (lin_vel_x_direct uncapped)
+- **Symptom**: During play with vel_x cmd = 0.4–0.8 m/s, the robot reached 1.2–2.0 m/s for pace gait. The direct-velocity reward was incentivising speed beyond the command.
+- **Cause**: `lin_vel_x_direct = clamp(vx, min=0)` rewarded any positive forward velocity without an upper bound. At pace, the CPG-driven stride dynamics naturally push the robot faster than the Gaussian tracking reward "wants," and the direct term kept paying for it.
+- **Fix**: `lin_vel_x_direct = min(clamp(vx, min=0), vel_cmd)` — implemented via `torch.minimum(vx.clamp(min=0), vel_cmd_tensor)` to handle the tensor/scalar type mismatch (PyTorch does not accept a scalar `min` with a tensor `max` in a single `clamp()` call).
+
 ---
 
-> Paper: [references/AllGaits: Learning All Quadruped Gaits and Transitions.pdf](references/AllGaits:%20Learning%20All%20Quadruped%20Gaits%20and%20Transitions.pdf) · arXiv 2411.04787 · Nov 2024
+> Paper: [references/CPG-RL: Learning Central Pattern Generators for Quadruped Locomotion.pdf](references/CPG-RL:%20Learning%20Central%20Pattern%20Generators%20for%20Quadruped%20Locomotion.pdf) · arXiv 2411.04787 · Nov 2024

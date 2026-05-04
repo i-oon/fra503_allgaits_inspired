@@ -37,9 +37,10 @@ from allgaits.envs.allgaits_env_cfg import (
     ACTION_OMEGA_HZ_MIN,
     AllGaitsEnvCfg,
     REWARD_LIN_VEL_X_DIRECT,
-    REWARD_HEADING,      # noqa: F401
-    REWARD_CPG_ACTIVE,   # noqa: F401
-    REWARD_CPG_RUNAWAY,  # noqa: F401
+    REWARD_HEADING,           # noqa: F401
+    REWARD_CPG_ACTIVE,        # noqa: F401
+    REWARD_CPG_RUNAWAY,       # noqa: F401
+    REWARD_FOOT_SLIP_PENALTY, # noqa: F401
 )
 
 
@@ -107,6 +108,11 @@ class AllGaitsEnv(DirectRLEnv):
         print(f"[AllGaitsEnv] matched foot bodies:       {list(foot_names)}  ids={foot_ids}", flush=True)
         print(f"[AllGaitsEnv] matched base/thigh bodies: {list(base_thigh_names)}  ids={base_thigh_ids}", flush=True)
 
+        # Articulation body indices for the feet — used by body_lin_vel_w for
+        # the foot-slip penalty (contact-sensor ids and articulation ids differ).
+        artic_foot_ids, _ = self._robot.find_bodies([".*_foot$"])
+        self._artic_foot_ids = torch.tensor(artic_foot_ids, device=self.device, dtype=torch.long)
+
         # --- CPG and pattern formation ---
         self._cpg = HopfCPG(
             num_envs=self.num_envs,
@@ -149,6 +155,16 @@ class AllGaitsEnv(DirectRLEnv):
         # Used by the action-rate reward term to penalize jerky / runaway actions.
         self._prev_action = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._joint_targets_cpg_order = torch.zeros(self.num_envs, 12, device=self.device)
+
+        # --- Domain randomization state ---
+        self._push_interval_steps: int = max(
+            1, int(self.cfg.dr_push_interval_s / (self.cfg.sim.dt * self.cfg.decimation))
+        )
+        # Staggered push timer: each env starts at a random offset so pushes
+        # are not synchronised across envs (would cause correlated gradient noise).
+        self._push_steps = torch.randint(
+            0, self._push_interval_steps, (self.num_envs,), device=self.device, dtype=torch.long
+        )
 
         # --- Initial reset across all envs ---
         all_ids = torch.arange(self.num_envs, device=self.device)
@@ -274,10 +290,15 @@ class AllGaitsEnv(DirectRLEnv):
 
         action_rate = (self._last_action - self._prev_action).pow(2).sum(dim=-1)
 
-        # Direct linear term: rewards any positive world-frame forward velocity,
-        # giving a nonzero gradient even at standstill where the Gaussian term
-        # is nearly flat (gradient ≈ 0.009 vs 0.075 near the target).
-        lin_vel_x_direct = self._robot.data.root_lin_vel_w[:, 0].clamp(min=0.0)
+        # Direct linear term: rewards positive forward velocity up to the command.
+        # Clamped at vel_cmd so the policy has no incentive to overshoot —
+        # running at 2× the command earns the same as running at exactly the
+        # command. Gradient at standstill is unchanged (still 2.0 per m/s);
+        # only the above-command region loses its spurious reward signal.
+        lin_vel_x_direct = torch.minimum(
+            self._robot.data.root_lin_vel_w[:, 0].clamp(min=0.0),
+            self._vel_cmd[:, 0],
+        )
 
         # Heading alignment: cos(yaw error) from quaternion (wxyz convention).
         # 1 - 2*(qy² + qz²) equals the body +x axis projected onto world +x.
@@ -295,6 +316,15 @@ class AllGaitsEnv(DirectRLEnv):
         cpg_active = omega_hz.clamp(max=3.0).mean(dim=-1)           # (N,) reward part
         cpg_runaway = (omega_hz - 3.0).clamp(min=0.0).pow(2).mean(dim=-1)  # (N,) penalty part
 
+        # Foot slip: mean (over legs) of world-frame horizontal speed for feet
+        # that are in ground contact.  Planted feet should be stationary;
+        # play showed 1–3 m/s slip on contacted feet across all gaits because
+        # training never penalised sliding.
+        foot_vel_w = self._robot.data.body_lin_vel_w[:, self._artic_foot_ids, :]  # (N, 4, 3)
+        foot_speed_xy = foot_vel_w[..., :2].norm(dim=-1)                          # (N, 4)
+        contacts = self._foot_contact_booleans()                                   # (N, 4)
+        foot_slip = (contacts * foot_speed_xy).mean(dim=-1)                        # (N,)
+
         # --- Weighted contributions (× dt) ---
         r_track = self.cfg.rew_lin_vel_x_tracking * lin_vel_x_track * dt
         r_lin_direct = self.cfg.rew_lin_vel_x_direct * lin_vel_x_direct * dt
@@ -305,9 +335,10 @@ class AllGaitsEnv(DirectRLEnv):
         r_ang_pen = -self.cfg.rew_ang_vel_xyz_penalty * ang_vel_xyz * dt
         r_power_pen = -self.cfg.rew_power_penalty * power * dt
         r_action_pen = -self.cfg.rew_action_rate_penalty * action_rate * dt
+        r_slip_pen = -self.cfg.rew_foot_slip_penalty * foot_slip * dt
 
         reward = (r_track + r_lin_direct + r_heading + r_cpg_active + r_cpg_runaway
-                  + r_yz_pen + r_ang_pen + r_power_pen + r_action_pen)
+                  + r_yz_pen + r_ang_pen + r_power_pen + r_action_pen + r_slip_pen)
 
         # --- Diagnostic log (averaged over envs by the runner) ---
         self._populate_extras_log(
@@ -320,6 +351,7 @@ class AllGaitsEnv(DirectRLEnv):
             r_ang_pen=r_ang_pen,
             r_power_pen=r_power_pen,
             r_action_pen=r_action_pen,
+            r_slip_pen=r_slip_pen,
             reward=reward,
             action_rate_raw=action_rate,
         )
@@ -336,6 +368,7 @@ class AllGaitsEnv(DirectRLEnv):
         r_ang_pen: torch.Tensor,
         r_power_pen: torch.Tensor,
         r_action_pen: torch.Tensor,
+        r_slip_pen: torch.Tensor,
         reward: torch.Tensor,
         action_rate_raw: torch.Tensor,
     ) -> None:
@@ -370,6 +403,7 @@ class AllGaitsEnv(DirectRLEnv):
             "rew/ang_vel_xyz_penalty": r_ang_pen,
             "rew/power_penalty": r_power_pen,
             "rew/action_rate_penalty": r_action_pen,
+            "rew/foot_slip_penalty": r_slip_pen,
             "rew/total": reward,
             # --- Locomotion diagnostics ---
             "locomotion/vel_x_cmd": vel_x_cmd,
@@ -418,8 +452,13 @@ class AllGaitsEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # --- Robot state: default pose at env origin, zero velocities ---
-        joint_pos = self._robot.data.default_joint_pos[env_ids]
+        joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self._robot.data.default_joint_vel[env_ids]
+        # DR: per-reset joint-position noise keeps the policy from overfitting
+        # to the single default rest pose (±dr_joint_pos_noise rad per joint).
+        if self.cfg.dr_joint_pos_noise > 0.0:
+            noise = (torch.rand_like(joint_pos) - 0.5) * (2.0 * self.cfg.dr_joint_pos_noise)
+            joint_pos = joint_pos + noise
         default_root_state = self._robot.data.default_root_state[env_ids].clone()
         # UNITREE_B1_CFG spawns trunk at z=0.42, but with default joints
         # (q_hip=0.1, q_thigh=0.8/1.0, q_calf=-1.5) the feet land at
@@ -444,6 +483,10 @@ class AllGaitsEnv(DirectRLEnv):
         self._prev_action[env_ids] = 0.0
         self._steps_since_vel_resample[env_ids] = 0
         self._steps_since_phi_resample[env_ids] = 0
+        # DR: stagger push timers so reset envs don't all push simultaneously.
+        self._push_steps[env_ids] = torch.randint(
+            0, self._push_interval_steps, (len(env_ids),), device=self.device, dtype=torch.long
+        )
 
     def _resample_velocity_command(self, env_ids: torch.Tensor) -> None:
         n = env_ids.numel()
@@ -491,6 +534,24 @@ class AllGaitsEnv(DirectRLEnv):
         if phi_ids.numel() > 0:
             self._resample_coupling_matrix(phi_ids)
             self._steps_since_phi_resample[phi_ids] = 0
+
+        # DR: periodic random push — apply Δv to the base in world xy + Δω around z.
+        # Velocity perturbation is instantaneous (one policy step) and forces the
+        # policy to learn active recovery rather than steady-state gait maintenance.
+        if self.cfg.dr_push_interval_s > 0.0:
+            self._push_steps += 1
+            push_ids = (self._push_steps >= self._push_interval_steps).nonzero(as_tuple=False).flatten()
+            if push_ids.numel() > 0:
+                n = push_ids.numel()
+                lin_vel_w = self._robot.data.root_lin_vel_w[push_ids].clone()   # (n, 3)
+                ang_vel_w = self._robot.data.root_ang_vel_w[push_ids].clone()   # (n, 3)
+                dv = (torch.rand(n, 2, device=self.device) - 0.5) * (2.0 * self.cfg.dr_push_lin_vel)
+                dw = (torch.rand(n, 1, device=self.device) - 0.5) * (2.0 * self.cfg.dr_push_ang_vel)
+                lin_vel_w[:, :2] += dv
+                ang_vel_w[:, 2:3] += dw
+                root_vel = torch.cat([lin_vel_w, ang_vel_w], dim=-1)   # (n, 6)
+                self._robot.write_root_velocity_to_sim(root_vel, env_ids=push_ids)
+                self._push_steps[push_ids] = 0
 
     # DirectRLEnv calls _get_rewards → _get_dones → _reset_idx each step.
     # We hook into post-step to drive the periodic resampling.

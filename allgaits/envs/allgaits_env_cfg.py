@@ -103,11 +103,11 @@ TERMINATION_BASE_CONTACT_THRESHOLD_N: float = 50.0
 # ---------------------------------------------------------------------------
 # Reward weights (paper Table I — multiplied by control dt = 0.01 s internally)
 # ---------------------------------------------------------------------------
-REWARD_LIN_VEL_X_TRACKING: float = 6.0   # was 3.0 — doubled to overcome standstill reward floor
+REWARD_LIN_VEL_X_TRACKING: float = 8.0   # was 6.0 — boosted with sigma widening to restore gradient at realistic error (~0.3 m/s)
 REWARD_LIN_VEL_YZ_PENALTY: float = 2.0
 REWARD_ANG_VEL_XYZ_PENALTY: float = 0.35  # 2.0 killed all gaits (ω=0 collapse); 0.1 allows spinning; 0.35 suppresses runaway yaw while letting oscillation-induced transients pass
 REWARD_POWER_PENALTY: float = 0.001
-REWARD_TRACKING_SIGMA: float = 0.15   # was 0.25 — sharper Gaussian; standstill now pays 0.014 not 0.054
+REWARD_TRACKING_SIGMA: float = 0.25   # widened from 0.15 — lin_vel_x_direct now prevents standstill basin, so sigma doesn't need to be aggressive; at 0.15 the gradient at typical 0.3 m/s error was ≈0, starving tracking signal
 # Action-rate penalty is NOT in the paper's Table I, but it's required here
 # because our Gaussian policy's learnable std would otherwise run away (the
 # clamp in the action decoder has zero gradient outside the range). Gives
@@ -134,12 +134,44 @@ REWARD_LIN_VEL_X_DIRECT: float = 2.0
 # incentive to maintain forward heading, replacing the structural problem where
 # ang_vel penalty alone suppressed pace/bound by punishing oscillation-induced
 # yaw before the policy could correct it.
-REWARD_HEADING: float = 1.5
+REWARD_HEADING: float = 3.0
+# Doubled 1.5 → 3.0: heading reward at 1.5 was losing to the thigh-asymmetry
+# yaw-spin torque — all 4 envs rotated ~90° in 18 s during play even though
+# the policy was otherwise stable. 3.0 gives it enough signal to fight back.
 # CPG activity: rewards mean leg frequency (Hz), providing a nonzero gradient
 # at ω=0 so that the policy cannot treat "freeze all legs" as a local optimum
 # for gaits whose instability penalties previously outweighed locomotion rewards.
 REWARD_CPG_ACTIVE: float = 0.5   # reward ω linearly up to 3 Hz (natural stride range); paired with CPG_RUNAWAY penalty to prevent 6-8 Hz blowup seen in Phase B v5
 REWARD_CPG_RUNAWAY: float = 2.0  # quadratic penalty on ω above 3 Hz — hard ceiling without removing gradient below it
+# Foot slip: penalise the world-frame horizontal speed of any foot that is in
+# contact with the ground.  contact × foot_speed_xy encourages the policy to
+# place feet and hold them stationary rather than sliding.  Slip velocities of
+# 1–3 m/s were observed during play (phase_b_dr_v1) on planted feet, causing
+# poor velocity tracking and inefficient gait.
+REWARD_FOOT_SLIP_PENALTY: float = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Domain Randomization
+# ---------------------------------------------------------------------------
+# Push disturbances: every dr_push_interval_s, a random horizontal velocity
+# impulse is applied to the base (Δv_xy + Δω_z). Forces the policy to learn
+# active recovery rather than relying on stable steady-state gaits.
+DR_PUSH_INTERVAL_S: float = 4.0     # seconds between pushes per env
+DR_PUSH_LIN_VEL: float = 0.5        # max |Δv| in world xy, m/s
+#   Paper (Go1, ~12 kg) applies ~30 N for 0.1 s → Δv ≈ 0.25 m/s.
+#   B1 is 5× heavier and more stable, so 0.5 m/s is intentionally harder —
+#   it can reverse direction at low cmd speeds, forcing real recovery learning.
+DR_PUSH_ANG_VEL: float = 0.3        # max |Δω| around world z, rad/s
+#   Reduced from 0.4: B1 already has systematic yaw drift from thigh asymmetry;
+#   0.4 rad/s yaw push fights ang_vel penalty every push → noisy gradients.
+# Joint-position noise: ± this many rad added to default joint pos at each
+# episode reset. Prevents the policy from memorising a single rest pose.
+#   Paper (Go1, stiffness ~200 N·m/rad) uses ±0.2 rad.
+#   B1 stiffness = 600 N·m/rad → 0.2 × (200/600) ≈ 0.067 → 0.07 rad.
+#   Larger noise would produce ~600 × 0.2 = 120 N·m per joint at reset,
+#   ~340 N through the leg — enough to trip the 50 N base-contact threshold.
+DR_JOINT_POS_NOISE: float = 0.07    # rad
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +271,7 @@ class AllGaitsEnvCfg(DirectRLEnvCfg):
     rew_heading: float = REWARD_HEADING
     rew_cpg_active: float = REWARD_CPG_ACTIVE
     rew_cpg_runaway: float = REWARD_CPG_RUNAWAY
+    rew_foot_slip_penalty: float = REWARD_FOOT_SLIP_PENALTY
     rew_lin_vel_yz_penalty: float = REWARD_LIN_VEL_YZ_PENALTY
     rew_ang_vel_xyz_penalty: float = REWARD_ANG_VEL_XYZ_PENALTY
     rew_power_penalty: float = REWARD_POWER_PENALTY
@@ -248,3 +281,9 @@ class AllGaitsEnvCfg(DirectRLEnvCfg):
     # --- Resampling periods ---
     vel_resample_s: float = VEL_RESAMPLE_S
     phi_resample_s: float = PHI_RESAMPLE_S
+
+    # --- Domain Randomization ---
+    dr_push_interval_s: float = DR_PUSH_INTERVAL_S
+    dr_push_lin_vel: float = DR_PUSH_LIN_VEL
+    dr_push_ang_vel: float = DR_PUSH_ANG_VEL
+    dr_joint_pos_noise: float = DR_JOINT_POS_NOISE
