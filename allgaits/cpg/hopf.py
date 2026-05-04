@@ -29,9 +29,10 @@ class HopfCPG:
         num_envs: parallel environments.
         num_legs: oscillators per env (4 for a quadruped).
         convergence_factor: `a` in paper eq 1. Larger → faster amplitude
-            convergence to μ. Paper is silent on the exact value; a=150
-            (common in Bellegarda's prior CPG-RL work) gives critically
-            damped convergence within ~100 ms.
+            convergence to μ. AllGaits inherits this value from CPG-RL
+            (Bellegarda & Ijspeert, IEEE RAL 2022, §III-A) which specifies
+            a=150 explicitly. Gives critically damped convergence within
+            ~100 ms.
         dt: integration timestep in seconds (paper: 1e-3).
         device, dtype: torch placement.
     """
