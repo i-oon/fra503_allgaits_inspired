@@ -60,30 +60,32 @@ Port the AllGaits framework to the Unitree B1 in Isaac Lab 0.36.3 / Isaac Sim 4.
    - Logs: `logs/rsl_rl/allgaits_b1/` (TensorBoard: `tensorboard --logdir logs/rsl_rl/allgaits_b1`)
 5. **Sim evaluation** ✅ *3 gaits validated in play*
 
-### Best checkpoint — `logs/rsl_rl/allgaits_b1/phase_b_dr_v2/final_model.pt`
+### Best checkpoint — `logs/rsl_rl/allgaits_b1/phase_b_dr_v3/final_model.pt`
 
-Trained on Phase B (walk/trot/pace) + domain randomization (push forces + joint noise) + heading reward 3.0 + foot slip penalty. 5000 iterations, 4096 envs.
+Trained on Phase B (walk/trot/pace) + domain randomization + heading=3.0 + foot slip penalty + widened tracking σ=0.25 + tracking weight=8.0. 5000 iterations, 4096 envs.
 
 **End-of-training metrics (iteration 4999):**
 
 | Metric | Value |
 |--------|-------|
-| Mean episode length | 1952 / 2000 steps |
+| Mean episode length | 1955 / 2000 steps |
 | Fall rate | 0.000 |
-| vel_x cmd (mean) | 1.34 m/s |
-| vel_x actual (mean) | 0.997 m/s |
-| vel_x error (mean) | 0.34 m/s |
-| ω_Hz (mean) | 2.78 Hz |
-| foot slip penalty | −0.0013 (near zero) |
-| Mean noise std | 0.15 |
+| Max base contact force | 0.000 N |
+| vel_x cmd (mean) | 1.35 m/s |
+| vel_x actual (mean) | 1.044 m/s |
+| vel_x error (mean) | 0.303 m/s |
+| tracking reward | 0.0570 |
+| ω_Hz (mean) | 2.76 Hz |
+| foot slip penalty | −0.0012 (near zero) |
+| Mean noise std | 0.07 |
 
 ```bash
 # trot
-python scripts/play.py --load_run phase_b_dr_v2 --model final_model \
+python scripts/play.py --load_run phase_b_dr_v3 --model final_model \
     --gait trot --vel_x 0.8 --num_envs 4
 
 # walk → trot → pace sequence
-python scripts/play.py --load_run phase_b_dr_v2 --model final_model \
+python scripts/play.py --load_run phase_b_dr_v3 --model final_model \
     --gait_sequence "walk:200:0.5,trot:200:1.0,pace:200:1.2" \
     --episode_length 600 --num_envs 4
 
@@ -93,11 +95,12 @@ python scripts/plot_jerk.py --smooth 20
 
 **Training progression (Phase B):**
 
-| Run | Key change | Mean vx | Falls |
-|-----|-----------|---------|-------|
-| `phase_b_3gaits` | baseline (heading=1.5, no DR) | ~0.56 m/s trot | 0/4 but severe yaw drift |
-| `phase_b_dr_v1` | + DR (push + joint noise) | 0.21 m/s | 0 — DR working but yaw drift persisted |
-| `phase_b_dr_v2` | + heading=3.0, foot slip penalty | **0.97 m/s** | **0** — 5× improvement |
+| Run | Key change | Mean vx | Tracking reward | Falls |
+|-----|-----------|---------|-----------------|-------|
+| `phase_b_3gaits` | baseline (heading=1.5, no DR, σ=0.25, w=3) | ~0.56 m/s trot | — | 0 but severe yaw drift |
+| `phase_b_dr_v1` | + DR (push + joint noise) | 0.21 m/s | — | 0 — yaw drift persisted |
+| `phase_b_dr_v2` | + heading=3.0, foot slip, σ=0.15, w=6 | 0.997 m/s | 0.0367 | **0** |
+| `phase_b_dr_v3` | + σ=0.25, w=8 (gradient fix) | **1.044 m/s** | **0.0570** (+55%) | **0** |
 
 ### Differences from the paper
 

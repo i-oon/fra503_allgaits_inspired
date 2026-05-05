@@ -69,6 +69,11 @@ parser.add_argument("--gait_sequence", type=str, default=None,
                          "E.g. 'trot:600:0.8,walk:600:0.4,pace:600:0.4'. "
                          "Switches Φ (and optionally vel_x) at each step boundary. "
                          "Tip: set --episode_length to sum of all step counts.")
+parser.add_argument("--metrics_out", type=str, default="play_metrics_log.csv",
+                    help="Output CSV path for the rich metrics log (contacts, CPG state, yaw).")
+parser.add_argument("--seed", type=int, default=None,
+                    help="Random seed for style-param sampling. Fixes the per-env param draw "
+                         "so results are reproducible. Find a good seed once, then reuse it.")
 
 # Policy sampling mode
 parser.add_argument("--stochastic", action="store_true",
@@ -351,6 +356,13 @@ def _print_summary(per_env_stats: dict[str, list[torch.Tensor]], num_envs: int) 
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
+    if args.seed is not None:
+        import random, numpy as np
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"[play] random seed: {args.seed}")
+
     env_cfg_fn = gym.spec(args.task).kwargs["env_cfg_entry_point"]
     env_cfg = env_cfg_fn() if callable(env_cfg_fn) else env_cfg_fn
     env_cfg.scene.num_envs = args.num_envs
@@ -549,13 +561,21 @@ def main() -> None:
 
         _jv = env_unwrapped._robot.data.joint_vel[:, env_unwrapped._cpg_to_usd_joint_idx].detach().cpu()  # (N, 12) CPG order
         _bv = env_unwrapped._robot.data.root_lin_vel_b.detach().cpu()   # (N, 3)
+        _ct = _contact_now.detach().cpu()                                # (N, 4)
+        _quat = env_unwrapped._robot.data.root_quat_w.detach().cpu()    # (N, 4) wxyz
+        _cpg_r = env_unwrapped._cpg.r.detach().cpu()                    # (N, 4) amplitude per leg
+        _cpg_theta = env_unwrapped._cpg.theta.detach().cpu()            # (N, 4) phase per leg, rad
+        _yaw = torch.atan2(
+            2 * (_quat[:, 0] * _quat[:, 3] + _quat[:, 1] * _quat[:, 2]),
+            1 - 2 * (_quat[:, 2] ** 2 + _quat[:, 3] ** 2),
+        )  # (N,)  rad
         for _ei in range(args.num_envs):
             for _li in range(4):
                 _slip_log.append({
                     "step": step + 1,
                     "env": _ei,
                     "leg": _leg_labels[_li],
-                    "contact": int(_contact_now[_ei, _li].item()),
+                    "contact": int(_ct[_ei, _li].item()),
                     "foot_world_x": _foot_pos_w[_ei, _li, 0].item(),
                     "foot_slip_vx": _foot_vx[_ei, _li].item(),
                 })
@@ -565,6 +585,23 @@ def main() -> None:
                 "gait": _seq_gait if _seq_gait else "sampled",
                 "vx_cmd": _seq_vel,
                 "bvx": _bv[_ei, 0].item(),
+                "bvy": _bv[_ei, 1].item(),
+                "yaw_deg": math.degrees(_yaw[_ei].item()),
+                # foot contacts
+                "ct_FL": int(_ct[_ei, 0].item()),
+                "ct_FR": int(_ct[_ei, 1].item()),
+                "ct_RL": int(_ct[_ei, 2].item()),
+                "ct_RR": int(_ct[_ei, 3].item()),
+                # CPG amplitude r (limit-cycle radius per leg)
+                "cpg_r_FL": _cpg_r[_ei, 0].item(),
+                "cpg_r_FR": _cpg_r[_ei, 1].item(),
+                "cpg_r_RL": _cpg_r[_ei, 2].item(),
+                "cpg_r_RR": _cpg_r[_ei, 3].item(),
+                # CPG phase θ in [0, 2π)
+                "cpg_theta_FL": _cpg_theta[_ei, 0].item() % (2 * math.pi),
+                "cpg_theta_FR": _cpg_theta[_ei, 1].item() % (2 * math.pi),
+                "cpg_theta_RL": _cpg_theta[_ei, 2].item() % (2 * math.pi),
+                "cpg_theta_RR": _cpg_theta[_ei, 3].item() % (2 * math.pi),
                 **{col: _jv[_ei, j].item() for j, col in enumerate(_jnt_cols)},
             })
 
@@ -585,13 +622,19 @@ def main() -> None:
         _w.writerows(_slip_log)
     print(f"\n[play] foot slip log → {_slip_path}  ({len(_slip_log)} rows)")
 
-    _joint_path = "play_joint_log.csv"
-    _jnt_fields = ["step", "env", "gait", "vx_cmd", "bvx"] + _jnt_cols
-    with open(_joint_path, "w", newline="") as _f:
-        _w = csv.DictWriter(_f, fieldnames=_jnt_fields)
+    _metrics_path = args.metrics_out
+    _metrics_fields = (
+        ["step", "env", "gait", "vx_cmd", "bvx", "bvy", "yaw_deg"]
+        + ["ct_FL", "ct_FR", "ct_RL", "ct_RR"]
+        + ["cpg_r_FL", "cpg_r_FR", "cpg_r_RL", "cpg_r_RR"]
+        + ["cpg_theta_FL", "cpg_theta_FR", "cpg_theta_RL", "cpg_theta_RR"]
+        + _jnt_cols
+    )
+    with open(_metrics_path, "w", newline="") as _f:
+        _w = csv.DictWriter(_f, fieldnames=_metrics_fields)
         _w.writeheader()
         _w.writerows(_joint_log)
-    print(f"[play] joint velocity log → {_joint_path}  ({len(_joint_log)} rows)")
+    print(f"[play] metrics log → {_metrics_path}  ({len(_joint_log)} rows)")
 
     env.close()
     sim_app.close()

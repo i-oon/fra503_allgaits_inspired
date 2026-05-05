@@ -22,7 +22,7 @@ import pandas as pd
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Plot jerk from play_joint_log.csv.")
-parser.add_argument("--csv", type=str, default="play_joint_log.csv")
+parser.add_argument("--csv", type=str, default="play_metrics_log.csv")
 parser.add_argument("--env", type=int, default=0, help="Which env index to plot.")
 parser.add_argument("--smooth", type=int, default=20,
                     help="Rolling-window half-width for smoothing (steps). 0 = no smoothing.")
